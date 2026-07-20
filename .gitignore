@@ -4,3 +4,6 @@ build
 
 credentials.json
 token.json
+src/auth/tokens/
+src/auth/active-profile
+src/auth/profiles.json

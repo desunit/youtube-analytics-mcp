@@ -318,10 +318,11 @@ export class YouTubeClient {
         return await this.youtubeAnalytics.reports.query({
           startDate: params.startDate,
           endDate: params.endDate,
+          // NO `day` dimension: we want ONE aggregated row for the whole period.
+          // With `dimensions: 'day'` the API returns one row per day and the parser
+          // only read row[0] (the first day) — so a week reported a single day's views.
           metrics: 'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained,subscribersLost',
-          dimensions: 'day',
-          ids: 'channel==MINE',
-          sort: 'day'
+          ids: 'channel==MINE'
         });
       });
 

@@ -37,36 +37,40 @@ export function parseChannelOverview(data: ParsedAnalytics): ChannelOverviewData
   }
 
   const metrics = data.columnHeaders?.map((header: ColumnHeader) => header.name) || [];
-  const totalRow = data.rows[0] || [];
-  
+  const idx = (name: string) => metrics.indexOf(name);
+  const iViews = idx('views');
+  const iMinutes = idx('estimatedMinutesWatched');
+  const iDuration = idx('averageViewDuration');
+  const iPercentage = idx('averageViewPercentage');
+  const iSubs = idx('subscribersGained');
+
+  // Aggregate across ALL rows, not just rows[0]. Additive metrics (views, watch time,
+  // subscribers) are summed; the rate metrics (avg view duration / percentage) are
+  // views-weighted averages so a multi-row (e.g. per-day) response still totals correctly.
   const result: ChannelOverviewData = {
     totalViews: 0,
     estimatedMinutesWatched: 0,
     subscribersGained: 0,
     averageViewDuration: 0
   };
-  
-  metrics.forEach((metric: string, index: number) => {
-    const value = Number(totalRow[index] || 0);
-    
-    switch (metric) {
-      case 'views':
-        result.totalViews = value;
-        break;
-      case 'estimatedMinutesWatched':
-        result.estimatedMinutesWatched = value;
-        break;
-      case 'subscribersGained':
-        result.subscribersGained = value;
-        break;
-      case 'averageViewDuration':
-        result.averageViewDuration = value;
-        break;
-      case 'averageViewPercentage':
-        result.averageViewPercentage = value;
-        break;
-    }
-  });
+  let durationWeighted = 0;
+  let percentageWeighted = 0;
+  let weight = 0;
+  let sawPercentage = false;
+
+  for (const row of data.rows) {
+    const v = iViews >= 0 ? Number(row[iViews] || 0) : 0;
+    const w = v || 1; // avoid zero-weight rows collapsing the average
+    result.totalViews += v;
+    if (iMinutes >= 0) result.estimatedMinutesWatched += Number(row[iMinutes] || 0);
+    if (iSubs >= 0) result.subscribersGained += Number(row[iSubs] || 0);
+    if (iDuration >= 0) durationWeighted += Number(row[iDuration] || 0) * w;
+    if (iPercentage >= 0) { percentageWeighted += Number(row[iPercentage] || 0) * w; sawPercentage = true; }
+    weight += w;
+  }
+
+  if (iDuration >= 0) result.averageViewDuration = weight ? durationWeighted / weight : 0;
+  if (sawPercentage) result.averageViewPercentage = weight ? percentageWeighted / weight : 0;
 
   return result;
 }

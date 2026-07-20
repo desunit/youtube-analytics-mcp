@@ -1,13 +1,32 @@
 import { authenticate } from '@google-cloud/local-auth';
 import { promises as fs } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { OAuth2Client } from 'google-auth-library';
 import path from 'path';
-import { AuthConfig, AuthenticationError, TokenData, TokenExpiredError } from './types.js';
+import { AuthConfig, AuthenticationError, OAuthClientConfig, TokenData, TokenExpiredError } from './types.js';
 
+/**
+ * AuthManager with multi-account PROFILES.
+ *
+ * Each Google account/channel is a named profile with its own token at
+ * `src/auth/tokens/<profile>.json`. The active profile is chosen by (in order):
+ *   1. the `YT_PROFILE` env var, else
+ *   2. `src/auth/active-profile` (written by switch_profile / reauth.cjs), else
+ *   3. "default".
+ * A single OAuth client (credentials.json) is shared across profiles — only the
+ * user token differs, so every profile keeps using `channel==MINE` and works for
+ * Brand Accounts, Gmail, or Workspace channels alike.
+ *
+ * Backward compatible: if a profile has no token file but a legacy
+ * `src/auth/token.json` exists, the "default" profile falls back to it.
+ */
 export class AuthManager {
   private readonly AUTH_DIR = path.join(process.cwd(), 'src', 'auth');
   private readonly CREDENTIALS_PATH = path.join(this.AUTH_DIR, 'credentials.json');
-  private readonly TOKEN_PATH = path.join(this.AUTH_DIR, 'token.json');
+  private readonly LEGACY_TOKEN_PATH = path.join(this.AUTH_DIR, 'token.json');
+  private readonly TOKENS_DIR = path.join(this.AUTH_DIR, 'tokens');
+  private readonly ACTIVE_FILE = path.join(this.AUTH_DIR, 'active-profile');
+  private readonly META_PATH = path.join(this.AUTH_DIR, 'profiles.json');
   private readonly SCOPES = [
     'https://www.googleapis.com/auth/youtube.readonly',
     'https://www.googleapis.com/auth/yt-analytics.readonly',
@@ -15,52 +34,145 @@ export class AuthManager {
   ];
 
   private authClient: OAuth2Client | null = null;
+  private loadedProfile: string | null = null;   // which profile authClient was built from
 
-  constructor() {
+  constructor() {}
+
+  // ---------- profiles ----------
+
+  /** The active profile name: YT_PROFILE env → active-profile file → "default". */
+  getActiveProfile(): string {
+    const env = process.env.YT_PROFILE?.trim();
+    if (env) return this.sanitizeProfile(env);
+    try {
+      const p = readFileSync(this.ACTIVE_FILE, 'utf8').trim();
+      if (p) return this.sanitizeProfile(p);
+    } catch { /* no file yet */ }
+    return 'default';
+  }
+
+  /** Switch the active profile (persisted) and drop the cached client. */
+  setActiveProfile(name: string): string {
+    const clean = this.sanitizeProfile(name);
+    mkdirSync(this.AUTH_DIR, { recursive: true });
+    writeFileSync(this.ACTIVE_FILE, clean, 'utf8');
+    this.authClient = null;
+    this.loadedProfile = null;
+    return clean;
+  }
+
+  /** Does the given profile have a usable token on disk? */
+  hasToken(profile: string): boolean {
+    const clean = this.sanitizeProfile(profile);
+    if (existsSync(this.tokenPathFor(clean))) return true;
+    return clean === 'default' && existsSync(this.LEGACY_TOKEN_PATH);
+  }
+
+  /** List known profiles (token files + legacy default), marking the active one. */
+  listProfiles(): { name: string; active: boolean; channelTitle?: string; channelId?: string }[] {
+    const active = this.getActiveProfile();
+    const names = new Set<string>();
+    try {
+      for (const f of readdirSync(this.TOKENS_DIR)) {
+        if (f.endsWith('.json')) names.add(f.slice(0, -5));
+      }
+    } catch { /* no tokens dir yet */ }
+    if (existsSync(this.LEGACY_TOKEN_PATH)) names.add('default');
+    if (names.size === 0) names.add(active);   // surface the active name even if unauthed
+
+    const meta = this.readMeta();
+    return [...names].sort().map(name => ({
+      name,
+      active: name === active,
+      channelTitle: meta[name]?.title,
+      channelId: meta[name]?.channelId,
+    }));
+  }
+
+  private sanitizeProfile(name: string): string {
+    const clean = (name || '').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!clean) throw new AuthenticationError('Invalid profile name');
+    return clean;
+  }
+
+  private tokenPathFor(profile: string): string {
+    return path.join(this.TOKENS_DIR, `${profile}.json`);
+  }
+
+  /** Where the ACTIVE profile's token is read from (with legacy fallback for "default"). */
+  private resolveTokenPath(): string {
+    const profile = this.getActiveProfile();
+    const p = this.tokenPathFor(profile);
+    if (existsSync(p)) return p;
+    if (profile === 'default' && existsSync(this.LEGACY_TOKEN_PATH)) return this.LEGACY_TOKEN_PATH;
+    return p; // may not exist yet → triggers the auth flow
+  }
+
+  private readMeta(): Record<string, { channelId?: string; title?: string }> {
+    try {
+      return JSON.parse(readFileSync(this.META_PATH, 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+
+  // ---------- OAuth client config ----------
+
+  // Google OAuth credential files store the client under `web` (Web app) or
+  // `installed` (Desktop app). Return whichever is present.
+  private getClientConfig(credentials: AuthConfig): OAuthClientConfig {
+    const clientConfig = credentials.installed ?? credentials.web;
+    if (!clientConfig) {
+      throw new AuthenticationError(
+        'Invalid credentials file: expected an "installed" or "web" OAuth client.'
+      );
+    }
+    return clientConfig;
   }
 
   async getAuthClient(): Promise<OAuth2Client> {
-    // Return cached client if available and valid
-    if (this.authClient) {
+    const profile = this.getActiveProfile();
+
+    // Reuse the cached client only if it belongs to the still-active profile.
+    if (this.authClient && this.loadedProfile === profile) {
       try {
         await this.refreshTokenIfNeeded(this.authClient);
         return this.authClient;
       } catch (error) {
-        console.log('Cached auth client invalid, creating new one...');
+        console.error('Cached auth client invalid, creating new one...');
         this.authClient = null;
       }
+    } else if (this.authClient && this.loadedProfile !== profile) {
+      // Active profile changed under us — drop the stale client.
+      this.authClient = null;
     }
 
     try {
-      // Try to load existing token
-      const content = await fs.readFile(this.TOKEN_PATH, 'utf8');
+      const tokenPath = this.resolveTokenPath();
+      const content = await fs.readFile(tokenPath, 'utf8');
       const tokenData: TokenData = JSON.parse(content);
-      
-      // Load credentials to get client_id and client_secret
+
       const credentialsContent = await fs.readFile(this.CREDENTIALS_PATH, 'utf8');
       const credentials: AuthConfig = JSON.parse(credentialsContent);
-      
-      // Create OAuth2Client with proper credentials
+      const clientConfig = this.getClientConfig(credentials);
+
       this.authClient = new OAuth2Client(
-        credentials.web.client_id,
-        credentials.web.client_secret,
-        credentials.web.redirect_uris[0]
+        clientConfig.client_id,
+        clientConfig.client_secret,
+        clientConfig.redirect_uris?.[0]
       );
-      
-      // Set the stored tokens
+
       this.authClient.setCredentials({
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token,
         expiry_date: tokenData.expiry_date
       });
-      
-      // Refresh token if needed
+
+      this.loadedProfile = profile;
       await this.refreshTokenIfNeeded(this.authClient);
-      
       return this.authClient;
     } catch (error) {
-      // If no token exists or loading fails, trigger authentication
-      console.log('No valid token found, initiating authentication flow...');
+      console.error(`No valid token for profile "${profile}", initiating authentication flow...`);
       this.authClient = null;
       return await this.authenticate();
     }
@@ -68,7 +180,6 @@ export class AuthManager {
 
   async authenticate(): Promise<OAuth2Client> {
     try {
-      // Check if credentials file exists
       try {
         await fs.access(this.CREDENTIALS_PATH);
       } catch {
@@ -78,19 +189,16 @@ export class AuthManager {
         );
       }
 
-      console.log('Auth manager CREDENTIALS_PATH', this.CREDENTIALS_PATH);
-
-      // Trigger OAuth flow using local-auth
       const client = await authenticate({
         scopes: this.SCOPES,
         keyfilePath: this.CREDENTIALS_PATH,
       });
 
-      // Save tokens
       if (client.credentials) {
         this.authClient = client as unknown as OAuth2Client;
+        this.loadedProfile = this.getActiveProfile();
         await this.saveToken(this.authClient);
-        console.log('Authentication successful! Tokens saved.');
+        console.error(`Authentication successful! Token saved for profile "${this.loadedProfile}".`);
       }
 
       return this.authClient || (client as unknown as OAuth2Client);
@@ -104,89 +212,84 @@ export class AuthManager {
 
   private async refreshTokenIfNeeded(auth: OAuth2Client): Promise<void> {
     try {
-      // Check if token is expired or about to expire (within 5 minutes)
       const now = Date.now();
       const expiryDate = auth.credentials.expiry_date;
       const fiveMinutesFromNow = now + (5 * 60 * 1000);
 
       if (!expiryDate || expiryDate <= fiveMinutesFromNow) {
-        console.log('Token expired or expiring soon, refreshing...');
-        
-        // Ensure we have a refresh token
         if (!auth.credentials.refresh_token) {
           console.error('No refresh token available');
           throw new TokenExpiredError('No refresh token available');
         }
-        
+
         const { credentials } = await auth.refreshAccessToken();
         auth.setCredentials(credentials);
-        
-        // Update stored token with new access token
         await this.updateStoredToken(auth);
-        
-        console.log('Token refreshed successfully');
       }
     } catch (error) {
       console.error('Token refresh failed:', error);
-      // Clear the cached client so we don't keep using invalid tokens
       this.authClient = null;
       throw new TokenExpiredError('Token refresh failed - please re-authenticate');
     }
   }
 
+  /** Save the current client's token to the ACTIVE profile's token file. */
   private async saveToken(client: OAuth2Client): Promise<void> {
     try {
-      // Read credentials to get client_id and client_secret
       const credentialsContent = await fs.readFile(this.CREDENTIALS_PATH, 'utf8');
       const credentials: AuthConfig = JSON.parse(credentialsContent);
+      const clientConfig = this.getClientConfig(credentials);
 
       const tokenData: TokenData = {
         type: 'authorized_user',
-        client_id: credentials.web.client_id,
-        client_secret: credentials.web.client_secret,
+        client_id: clientConfig.client_id,
+        client_secret: clientConfig.client_secret,
         refresh_token: client.credentials.refresh_token!,
         access_token: client.credentials.access_token || undefined,
         expiry_date: client.credentials.expiry_date || undefined
       };
 
-      await fs.writeFile(this.TOKEN_PATH, JSON.stringify(tokenData, null, 2));
-      
-      // Set restrictive permissions on token file
-      await fs.chmod(this.TOKEN_PATH, 0o600);
+      await fs.mkdir(this.TOKENS_DIR, { recursive: true });
+      const target = this.tokenPathFor(this.getActiveProfile());
+      await fs.writeFile(target, JSON.stringify(tokenData, null, 2));
+      await fs.chmod(target, 0o600);
     } catch (error) {
       throw new AuthenticationError(`Failed to save token: ${error}`);
     }
   }
 
+  /** Update the stored access token/expiry for the profile the client was loaded from. */
   private async updateStoredToken(auth: OAuth2Client): Promise<void> {
     try {
-      const content = await fs.readFile(this.TOKEN_PATH, 'utf8');
+      // Write back to wherever this client's token currently lives (honours legacy path).
+      const tokenPath = this.resolveTokenPath();
+      const content = await fs.readFile(tokenPath, 'utf8');
       const tokenData: TokenData = JSON.parse(content);
-      
-      // Update with new access token and expiry
+
       tokenData.access_token = auth.credentials.access_token || undefined;
       tokenData.expiry_date = auth.credentials.expiry_date || undefined;
-      
-      await fs.writeFile(this.TOKEN_PATH, JSON.stringify(tokenData, null, 2));
+
+      await fs.writeFile(tokenPath, JSON.stringify(tokenData, null, 2));
     } catch (error) {
       throw new AuthenticationError(`Failed to update stored token: ${error}`);
     }
   }
 
+  /** Revoke + remove ONLY the active profile's token (other profiles untouched). */
   async revokeToken(): Promise<void> {
     try {
       const auth = await this.getAuthClient();
       await auth.revokeCredentials();
-      
-      // Clear cached client
+
       this.authClient = null;
-      
-      // Remove stored token file
+      this.loadedProfile = null;
+
+      const tokenPath = this.resolveTokenPath();
       try {
-        await fs.unlink(this.TOKEN_PATH);
-        console.log('Token revoked and removed successfully');
+        await fs.unlink(tokenPath);
+        console.error(`Token revoked and removed for profile "${this.getActiveProfile()}".`);
       } catch (error) {
-        console.warn('Failed to remove token file:', error);
+        console.error('Failed to remove token file:', error);
       }
     } catch (error) {
       throw new AuthenticationError(`Failed to revoke token: ${error}`);
