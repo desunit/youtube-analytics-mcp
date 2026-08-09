@@ -7,6 +7,30 @@ export interface AgeGenderBreakdown {
   };
 }
 
+// The API returns SUBSCRIBED / UNSUBSCRIBED. Match exactly — a substring test on
+// "subscribed" also matches "UNSUBSCRIBED" and puts every row in the subscriber bucket.
+function isSubscribed(subscribedStatus: string | undefined): boolean {
+  return subscribedStatus?.trim().toUpperCase() === 'SUBSCRIBED';
+}
+
+function splitBySubscribedStatus(subscriberData: SubscriberData[]): {
+  subscriberViews: number;
+  nonSubscriberViews: number;
+} {
+  let subscriberViews = 0;
+  let nonSubscriberViews = 0;
+
+  subscriberData.forEach(data => {
+    if (isSubscribed(data.subscribedStatus)) {
+      subscriberViews += data.views;
+    } else {
+      nonSubscriberViews += data.views;
+    }
+  });
+
+  return { subscriberViews, nonSubscriberViews };
+}
+
 export function formatDemographics(demographicData: DemographicData[]): string {
   if (!demographicData || demographicData.length === 0) {
     return "No demographic data available for the specified period.";
@@ -29,13 +53,13 @@ export function formatDemographics(demographicData: DemographicData[]): string {
     Object.entries(ageGenderData).forEach(([age, genderData]) => {
       output += `\n${age}:\n`;
       Object.entries(genderData).forEach(([gender, percentage]) => {
-        output += `  👤 ${gender}: ${formatPercentage(percentage)}%\n`;
+        output += `  👤 ${gender}: ${formatPercentage(percentage)}\n`;
       });
     });
   } else {
     // Fallback to simple display
     demographicData.forEach(data => {
-      output += `${data.ageGroup} ${data.gender}: ${formatPercentage(data.viewerPercentage)}%\n`;
+      output += `${data.ageGroup} ${data.gender}: ${formatPercentage(data.viewerPercentage)}\n`;
     });
   }
 
@@ -56,13 +80,13 @@ export function formatGeographicDistribution(geographicData: GeographicData[]): 
   
   geographicData.slice(0, 10).forEach((data, index) => {
     const percentage = totalViews > 0 ? ((data.views / totalViews) * 100) : 0;
-    output += `${index + 1}. 🏴 ${data.country}: ${formatNumber(data.views)} views (${formatPercentage(percentage)}%)\n`;
+    output += `${index + 1}. 🏴 ${data.country}: ${formatNumber(data.views)} views (${formatPercentage(percentage)})\n`;
   });
 
   if (geographicData.length > 10) {
     const remainingViews = geographicData.slice(10).reduce((sum, data) => sum + data.views, 0);
     const remainingPercentage = totalViews > 0 ? ((remainingViews / totalViews) * 100) : 0;
-    output += `... and ${geographicData.length - 10} other countries (${formatNumber(remainingViews)} views, ${formatPercentage(remainingPercentage)}%)\n`;
+    output += `... and ${geographicData.length - 10} other countries (${formatNumber(remainingViews)} views, ${formatPercentage(remainingPercentage)})\n`;
   }
 
   return output + "\n💡 Consider creating content in languages spoken by your top geographic markets.";
@@ -74,18 +98,8 @@ export function formatSubscriberAnalytics(subscriberData: SubscriberData[]): str
   }
 
   let output = "📈 Subscriber vs Non-Subscriber Analytics:\n\n";
-  
-  let subscriberViews = 0;
-  let nonSubscriberViews = 0;
-  
-  subscriberData.forEach(data => {
-    if (data.subscribedStatus && data.subscribedStatus.toLowerCase().includes('subscribed')) {
-      subscriberViews += data.views;
-    } else {
-      nonSubscriberViews += data.views;
-    }
-  });
-  
+
+  const { subscriberViews, nonSubscriberViews } = splitBySubscribedStatus(subscriberData);
   const totalViews = subscriberViews + nonSubscriberViews;
   
   if (totalViews > 0) {
@@ -93,8 +107,8 @@ export function formatSubscriberAnalytics(subscriberData: SubscriberData[]): str
     const nonSubscriberPercentage = (nonSubscriberViews / totalViews) * 100;
     
     output += `📊 View Distribution:\n`;
-    output += `👥 Subscriber Views: ${formatNumber(subscriberViews)} (${formatPercentage(subscriberPercentage)}%)\n`;
-    output += `🆕 Non-Subscriber Views: ${formatNumber(nonSubscriberViews)} (${formatPercentage(nonSubscriberPercentage)}%)\n\n`;
+    output += `👥 Subscriber Views: ${formatNumber(subscriberViews)} (${formatPercentage(subscriberPercentage)})\n`;
+    output += `🆕 Non-Subscriber Views: ${formatNumber(nonSubscriberViews)} (${formatPercentage(nonSubscriberPercentage)})\n\n`;
     
     // Growth insights
     if (nonSubscriberPercentage > 50) {
@@ -119,28 +133,18 @@ export function generateAudienceInsights(geographicData: GeographicData[], subsc
     const topCountryPercentage = totalViews > 0 ? (topCountry.views / totalViews) * 100 : 0;
     
     if (topCountryPercentage > 50) {
-      insights.push(`🎯 Geographic Concentration: ${topCountry.country} represents ${formatPercentage(topCountryPercentage)}% of views`);
+      insights.push(`🎯 Geographic Concentration: ${topCountry.country} represents ${formatPercentage(topCountryPercentage)} of views`);
     }
     
     if (geographicData.length >= 5) {
       const top5Percentage = geographicData.slice(0, 5).reduce((sum, data) => sum + data.views, 0) / totalViews * 100;
-      insights.push(`🌍 Global Reach: Top 5 countries account for ${formatPercentage(top5Percentage)}% of views`);
+      insights.push(`🌍 Global Reach: Top 5 countries account for ${formatPercentage(top5Percentage)} of views`);
     }
   }
   
   // Subscriber insights
   if (subscriberData && subscriberData.length > 0) {
-    let subscriberViews = 0;
-    let nonSubscriberViews = 0;
-    
-    subscriberData.forEach(data => {
-      if (data.subscribedStatus && data.subscribedStatus.toLowerCase().includes('subscribed')) {
-        subscriberViews += data.views;
-      } else {
-        nonSubscriberViews += data.views;
-      }
-    });
-    
+    const { subscriberViews, nonSubscriberViews } = splitBySubscribedStatus(subscriberData);
     const totalViews = subscriberViews + nonSubscriberViews;
     const subscriberPercentage = totalViews > 0 ? (subscriberViews / totalViews) * 100 : 0;
     
