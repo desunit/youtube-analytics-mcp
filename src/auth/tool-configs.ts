@@ -69,13 +69,14 @@ export const authTools: ToolConfig[] = [
         if (!profiles.length) {
           return { content: [{ type: "text", text: "No profiles yet. Authenticate one with `node reauth.cjs <profile-name>`." }] };
         }
+        const seed = authManager.getSeedProfile();
         const lines = profiles.map((p: any) =>
-          `${p.active ? "→" : " "} ${p.name}${p.channelTitle ? `  (${p.channelTitle})` : ""}${p.channelId ? `  [${p.channelId}]` : ""}`
+          `${p.active ? "→" : " "} ${p.name}${p.channelTitle ? `  (${p.channelTitle})` : ""}${p.channelId ? `  [${p.channelId}]` : ""}${p.name === seed ? "  (default for new sessions)" : ""}`
         );
         return {
           content: [{
             type: "text",
-            text: `Account profiles (→ = active):\n${lines.join("\n")}\n\nSwitch with: switch_profile { "profile": "<name>" }`
+            text: `Account profiles (→ = active in THIS session):\n${lines.join("\n")}\n\nSwitch with: switch_profile { "profile": "<name>" }\nA switch affects this session only. Add "persist": true to also change the default for new sessions.`
           }]
         };
       } catch (error) {
@@ -88,14 +89,18 @@ export const authTools: ToolConfig[] = [
   },
   {
     name: "switch_profile",
-    description: "Switch the active account/channel to a saved profile (from list_profiles). All subsequent analytics tools use that channel. No browser login if the profile is already authenticated.",
+    description: "Switch the active account/channel to a saved profile (from list_profiles). All subsequent analytics tools use that channel. The switch applies to THIS session only — it cannot change the channel another parallel session reads. No browser login if the profile is already authenticated.",
     category: "authentication",
     schema: z.object({
       profile: z.string().describe("Profile name to activate (see list_profiles). e.g. 'piano-companion'"),
+      persist: z.boolean().optional().describe("Also make this the starting profile of every FUTURE session. Default false — the switch stays local to this session."),
     }),
-    handler: async ({ profile }: { profile: string }, { authManager, clearYouTubeClientCache, getYouTubeClient }: ToolContext) => {
+    handler: async ({ profile, persist }: { profile: string; persist?: boolean }, { authManager, clearYouTubeClientCache, getYouTubeClient }: ToolContext) => {
       try {
-        const name = authManager.setActiveProfile(profile);
+        const name = authManager.setActiveProfile(profile, persist === true);
+        const scope = persist === true
+          ? 'this session, and the default for future sessions'
+          : 'this session only';
         clearYouTubeClientCache();
 
         if (!authManager.hasToken(name)) {
@@ -114,7 +119,7 @@ export const authTools: ToolConfig[] = [
           return {
             content: [{
               type: "text",
-              text: `Active profile is now "${name}".\nChannel: ${info.snippet.title} [${info.id}]`
+              text: `Active profile is now "${name}" (${scope}).\nChannel: ${info.snippet.title} [${info.id}]`
             }]
           };
         } catch (e) {

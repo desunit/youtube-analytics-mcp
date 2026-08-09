@@ -11,8 +11,14 @@ import { AuthConfig, AuthenticationError, OAuthClientConfig, TokenData, TokenExp
  * Each Google account/channel is a named profile with its own token at
  * `src/auth/tokens/<profile>.json`. The active profile is chosen by (in order):
  *   1. the `YT_PROFILE` env var, else
- *   2. `src/auth/active-profile` (written by switch_profile / reauth.cjs), else
- *   3. "default".
+ *   2. the in-memory profile set by switch_profile in THIS process, else
+ *   3. `src/auth/active-profile` — the seed default for a new process, else
+ *   4. "default".
+ *
+ * Step 2 keeps the profile per session. Every MCP session runs its own server
+ * process, so a switch in one session cannot change the channel another session
+ * reads. `switch_profile { persist: true }` also rewrites the seed file, which
+ * is the only way to change the starting profile of future sessions.
  * A single OAuth client (credentials.json) is shared across profiles — only the
  * user token differs, so every profile keeps using `channel==MINE` and works for
  * Brand Accounts, Gmail, or Workspace channels alike.
@@ -35,15 +41,22 @@ export class AuthManager {
 
   private authClient: OAuth2Client | null = null;
   private loadedProfile: string | null = null;   // which profile authClient was built from
+  private sessionProfile: string | null = null;  // per-process override set by switch_profile
 
   constructor() {}
 
   // ---------- profiles ----------
 
-  /** The active profile name: YT_PROFILE env → active-profile file → "default". */
+  /** The active profile: YT_PROFILE env → this session → active-profile file → "default". */
   getActiveProfile(): string {
     const env = process.env.YT_PROFILE?.trim();
     if (env) return this.sanitizeProfile(env);
+    if (this.sessionProfile) return this.sessionProfile;
+    return this.getSeedProfile();
+  }
+
+  /** The starting profile for a new process, read from the shared file. */
+  getSeedProfile(): string {
     try {
       const p = readFileSync(this.ACTIVE_FILE, 'utf8').trim();
       if (p) return this.sanitizeProfile(p);
@@ -51,11 +64,18 @@ export class AuthManager {
     return 'default';
   }
 
-  /** Switch the active profile (persisted) and drop the cached client. */
-  setActiveProfile(name: string): string {
+  /**
+   * Switch the active profile for THIS process and drop the cached client.
+   * `persist` also rewrites the shared seed file, which changes the starting
+   * profile of every future session. Leave it false to keep the switch local.
+   */
+  setActiveProfile(name: string, persist = false): string {
     const clean = this.sanitizeProfile(name);
-    mkdirSync(this.AUTH_DIR, { recursive: true });
-    writeFileSync(this.ACTIVE_FILE, clean, 'utf8');
+    if (persist) {
+      mkdirSync(this.AUTH_DIR, { recursive: true });
+      writeFileSync(this.ACTIVE_FILE, clean, 'utf8');
+    }
+    this.sessionProfile = clean;
     this.authClient = null;
     this.loadedProfile = null;
     return clean;
@@ -99,9 +119,9 @@ export class AuthManager {
     return path.join(this.TOKENS_DIR, `${profile}.json`);
   }
 
-  /** Where the ACTIVE profile's token is read from (with legacy fallback for "default"). */
-  private resolveTokenPath(): string {
-    const profile = this.getActiveProfile();
+  /** Where a profile's token lives (with legacy fallback for "default"). Defaults to the ACTIVE profile. */
+  private resolveTokenPath(profileName?: string): string {
+    const profile = profileName ?? this.getActiveProfile();
     const p = this.tokenPathFor(profile);
     if (existsSync(p)) return p;
     if (profile === 'default' && existsSync(this.LEGACY_TOKEN_PATH)) return this.LEGACY_TOKEN_PATH;
@@ -261,8 +281,11 @@ export class AuthManager {
   /** Update the stored access token/expiry for the profile the client was loaded from. */
   private async updateStoredToken(auth: OAuth2Client): Promise<void> {
     try {
-      // Write back to wherever this client's token currently lives (honours legacy path).
-      const tokenPath = this.resolveTokenPath();
+      // Pin the write to the profile this client was BUILT from, never the
+      // currently-active one. If the profile changes between load and refresh,
+      // resolveTokenPath() with no argument would put this access_token into a
+      // different account's token file, next to a refresh_token it does not match.
+      const tokenPath = this.resolveTokenPath(this.loadedProfile ?? undefined);
       const content = await fs.readFile(tokenPath, 'utf8');
       const tokenData: TokenData = JSON.parse(content);
 
